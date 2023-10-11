@@ -23,5 +23,6 @@ open cmd/powershell as admin
 
 run the below cmd changing the /Source to the location/drive of your iso/boot drive
 
-Dism /online /enable-feature /featurename:NetFX3 /All /Source:D:\sources\sxs /LimitAccess
+dism /online /enable-feature /featurename:NetFX3 /All /Source:D:\sources\sxs /LimitAccess
+dism /online /Add-Capability /CapabilityName:Browser.InternetExplorer~~~~0.0.11.0 /Source:D:\sources\sxs /LimitAccess
 ```
