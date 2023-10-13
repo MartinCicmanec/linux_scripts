@@ -8,6 +8,9 @@ for people seeing this post in the future, if roblox doesn't open in tiny10 then
 3] right click > new > String Value
 4] rename the newly created file to "Version" - exactly like this
 5] open the "Version" file, in the "Value Data:" field put "9.11.25211.0" - exactly like thisand that's it! go play roblox! and enjoy!
+6] Also probably add "W2kVersion": "9.11.25211.0" -- "svcVersion":"11.3750.19041.0" -- "svcUpdateVersion":"11.0.1000" - Did not help
+ Try more : "Build":"919041"
+    "Version Vector": {"IE":"9.0000", "VML":"1.0"}
 ```
 
 
@@ -27,3 +30,6 @@ dism /online /enable-feature /featurename:NetFX3 /All /Source:D:\sources\sxs /Li
 dism /online /Add-Capability /CapabilityName:Browser.InternetExplorer~~~~0.0.11.0 /Source:D:\sources\sxs /LimitAccess
 ```
  Check out GPU (passthrough)[https://wiki.archlinux.org/title/QEMU/Guest_graphics_acceleration] in future
+
+CHTT
+irm christitus.com/win | iex
