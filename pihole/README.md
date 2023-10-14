@@ -1,0 +1,1 @@
+A docker-compose file for my pihole server running on my raspberry-pi. Also added php server for testing web and nginx.
