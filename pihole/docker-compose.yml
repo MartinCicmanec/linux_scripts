@@ -84,6 +84,7 @@ services:
     volumes:
       - './php:/var/www/html'
     container_name: apache-php-app
+    restart: always
 
 
 #   Another container you might want to have running through the proxy
