@@ -7,7 +7,7 @@ for people seeing this post in the future, if roblox doesn't open in tiny10 then
 2] go here: Computer\HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Internet Explorer
 3] right click > new > String Value
 4] rename the newly created file to "Version" - exactly like this
-5] open the "Version" file, in the "Value Data:" field put "9.11.25211.0" - exactly like thisand that's it! go play roblox! and enjoy!
+5] open the "Version" file, in the "Value Data:" field put "9.11.25211.0" - exactly like thisand that is it! go play roblox! and enjoy!
 6] Also probably add "W2kVersion": "9.11.25211.0" -- "svcVersion":"11.3750.19041.0" -- "svcUpdateVersion":"11.0.1000" - Did not help
  Try more : "Build":"919041"
     "Version Vector": {"IE":"9.0000", "VML":"1.0"}
