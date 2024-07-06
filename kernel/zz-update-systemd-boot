@@ -28,10 +28,11 @@ ROOTFLAGS="quiet loglevel=0 systemd.show_status=false splash"
 # Our kernels.
 KERNELS=()
 FIND="find /boot -maxdepth 1 -name 'vmlinuz-*' -type f -print0 | sort -rz"
-while IFS= read -r -u3 -d $'\0' LINE; do
+
+eval "${FIND}" | while IFS= read -r -d $'\0' LINE; do
     KERNEL=$(basename "${LINE}")
     KERNELS+=("${KERNEL:8}")
-done 3< <(eval "${FIND}")
+done
 
 # There has to be at least one kernel.
 if [ ${#KERNELS[@]} -lt 1 ]; then
