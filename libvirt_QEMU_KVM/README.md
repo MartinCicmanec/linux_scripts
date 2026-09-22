@@ -89,3 +89,37 @@ Remove the share again:
 ```bash
 virt-xml --connect qemu:///system win10-ent --remove-device --filesystem target.dir=host_share
 ```
+
+# Host keeps the dead bridge route when the cable is pulled
+
+Symptom: unplug the cable (or the wifi drops and reconnects) and the host has no
+internet although wifi is associated.
+
+Cause: NetworkManager ignores carrier on bridges, so `br0` keeps its DHCP lease and
+its default route at metric 425, which outranks wifi's 600. Host traffic goes into a
+bridge with no uplink. The ethernet port is a bridge port, so NM does not react to its
+carrier either -- nothing tears the stale config down.
+
+Fix: `br0-uplink-watch` (systemd service) watches the carrier of the uplink port and
+flushes `br0`'s IPv4 when the cable is out, so the wifi route wins. Guests lose their
+uplink, which is fine -- only the host needs internet on wifi.
+
+```bash
+sudo install -m 755 br0-uplink-watch /usr/local/sbin/br0-uplink-watch
+sudo install -m 644 br0-uplink-watch.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now br0-uplink-watch
+journalctl -t br0-uplink-watch -f
+```
+
+Test it without touching the cable: `sudo ip link set enp0s31f6 down`, check
+`ip route`, then `sudo ip link set enp0s31f6 up`.
+
+Never run `nmcli connection up br0` (or restart NM) while a guest is running: NM
+re-creates the bridge's port list and silently detaches libvirt's `vnet0`, leaving the
+guest without network until the VM is restarted. Re-attach with
+`sudo ip link set vnet0 master br0`. Use `nmcli device reapply br0` instead -- it keeps
+foreign ports attached.
+
+Simpler alternative if you would rather not run a service: make the host always prefer
+wifi, `nmcli con mod br0 ipv4.route-metric 700 ipv6.route-metric 700` (wired then only
+carries host traffic when wifi is down).
