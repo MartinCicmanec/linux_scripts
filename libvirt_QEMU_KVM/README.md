@@ -90,19 +90,22 @@ Remove the share again:
 virt-xml --connect qemu:///system win10-ent --remove-device --filesystem target.dir=host_share
 ```
 
-# Host keeps the dead bridge route when the cable is pulled
+# Following the uplink cable (host and guests)
 
-Symptom: unplug the cable (or the wifi drops and reconnects) and the host has no
-internet although wifi is associated.
+Two symptoms, one cause: unplug the cable and the host has no internet although wifi is
+associated, and the guests sit on a bridge with no uplink.
 
-Cause: NetworkManager ignores carrier on bridges, so `br0` keeps its DHCP lease and
-its default route at metric 425, which outranks wifi's 600. Host traffic goes into a
-bridge with no uplink. The ethernet port is a bridge port, so NM does not react to its
-carrier either -- nothing tears the stale config down.
+NetworkManager ignores carrier on bridges, so `br0` keeps its DHCP lease and its default
+route at metric 425, which outranks wifi's 600 — host traffic goes into a dead bridge.
+The ethernet port is a bridge *port*, so NM does not react to its carrier either, and
+nothing tears the stale config down.
 
-Fix: `br0-uplink-watch` (systemd service) watches the carrier of the uplink port and
-flushes `br0`'s IPv4 when the cable is out, so the wifi route wins. Guests lose their
-uplink, which is fine -- only the host needs internet on wifi.
+`br0-uplink-watch` (systemd service) follows the carrier of `enp0s31f6`:
+
+| cable | host | guests |
+| --- | --- | --- |
+| in | `br0` has the LAN address, metric 425 | tap on `br0`, guest on 192.168.0.0/24 |
+| out | `br0` flushed, wifi default route wins | tap moved to `virbr0`, guest NAT'd out wifi |
 
 ```bash
 sudo install -m 755 br0-uplink-watch /usr/local/sbin/br0-uplink-watch
@@ -111,15 +114,40 @@ sudo systemctl daemon-reload && sudo systemctl enable --now br0-uplink-watch
 journalctl -t br0-uplink-watch -f
 ```
 
-Test it without touching the cable: `sudo ip link set enp0s31f6 down`, check
-`ip route`, then `sudo ip link set enp0s31f6 up`.
+Test it without touching the cable — a full cycle takes about 6 s:
+```bash
+sudo ip link set enp0s31f6 down    # ip route, virsh domiflist win10-ent
+sudo ip link set enp0s31f6 up
+```
 
-Never run `nmcli connection up br0` (or restart NM) while a guest is running: NM
-re-creates the bridge's port list and silently detaches libvirt's `vnet0`, leaving the
-guest without network until the VM is restarted. Re-attach with
-`sudo ip link set vnet0 master br0`. Use `nmcli device reapply br0` instead -- it keeps
-foreign ports attached.
+## Why wifi is not simply added to the bridge
 
-Simpler alternative if you would rather not run a service: make the host always prefer
-wifi, `nmcli con mod br0 ipv4.route-metric 700 ipv6.route-metric 700` (wired then only
-carries host traffic when wifi is down).
+It cannot be. An 802.11 station sends 3-address frames, and the AP only accepts ones
+whose source MAC is the station's own, so guest frames are dropped. The way around it is
+4-address (WDS) mode, which `iwlwifi` does not support and which foreign APs would not
+offer anyway. NAT through `virbr0` is the working equivalent: libvirt's `default` network
+masquerades 192.168.122.0/24 with no outbound-interface restriction, so it follows
+whatever default route the host has.
+
+While on wifi the guest can still reach the LAN outbound (masqueraded), but nothing on
+the LAN can reach the guest, and a router-side DHCP reservation for it does not apply.
+
+## Two traps this works around
+
+`nmcli connection up br0` (and an NM restart) silently detaches libvirt's `vnet0` from
+the bridge. libvirt never notices, so the guest stays offline until the VM is restarted —
+that is how `win10-ent` ended up with a detached tap. The watcher re-attaches a tap that
+is in the wrong bridge, and prefers `nmcli device reapply br0`, which keeps foreign ports.
+
+STP on `br0` cost 15-30 s on every replug: the port sits in listening/learning, so NM's
+DHCP finds no path and the address only arrives once the port forwards. With a single
+uplink port there is no loop to protect against:
+```bash
+sudo nmcli con mod br0 bridge.stp no
+sudo sh -c 'echo 0 > /sys/class/net/br0/bridge/stp_state'   # live, no reactivation
+```
+That took a replug from ~31 s down to ~6 s.
+
+Knobs: `POLL` (re-apply tick, only covers a guest started while unplugged) and `RETRY`
+(backoff after a failed action) in the unit file. `br0-uplink-watch --once` applies the
+current state and exits.

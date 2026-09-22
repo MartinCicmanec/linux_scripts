@@ -1,35 +1,65 @@
 #!/bin/bash
-# Keep the host's default route off the KVM bridge when the bridge has no uplink.
+# Follow the uplink cable: keep the host off a dead KVM bridge, and move the guests
+# to the NAT network while the bridge has no uplink.
 #
-# NetworkManager ignores carrier on bridges, so br0 keeps its DHCP lease (and its
-# default route at metric 425, which beats wifi's 600) after the cable is pulled.
-# The host then sends traffic into a dead bridge even though wifi is connected.
+# Host side: NetworkManager ignores carrier on bridges, so br0 keeps its DHCP lease
+# (and its default route at metric 425, which beats wifi's 600) after the cable is
+# pulled. The host then sends traffic into a dead bridge even though wifi is up.
+# On carrier loss we drop br0's IPv4 config so the wifi route wins. The bridge device
+# itself stays, so a running guest keeps its tap attached; restoring uses
+# `nmcli device reapply`, because `connection up` detaches foreign (libvirt) ports.
 #
-# On carrier loss we drop br0's IPv4 config, so the wifi route wins; the bridge
-# device itself stays, so a running guest keeps its tap attached. On carrier
-# return we restore it with `device reapply` -- `connection up` would detach any
-# foreign (libvirt) port from the bridge.
+# Guest side: a wifi client interface cannot be bridged (802.11 only accepts frames
+# whose source MAC is the station's own, and iwlwifi has no 4addr/WDS mode), so guests
+# get internet over wifi by NAT instead: their tap is moved to libvirt's virbr0 and
+# back. libvirt moves the tap silently, so the swap is wrapped in a link flap to make
+# the guest re-run DHCP on the new segment.
 
 set -u
 
-BRIDGE=${BRIDGE:-br0}
-PORT=${PORT:-enp0s31f6}
+BRIDGE=${BRIDGE:-br0}            # bridge the guests normally sit on
+PORT=${PORT:-enp0s31f6}          # uplink port whose carrier we follow
+NAT_BRIDGE=${NAT_BRIDGE:-virbr0} # libvirt NAT network, used while there is no uplink
+POLL=${POLL:-30}                 # re-apply tick, catches guests started off-event
+RETRY=${RETRY:-20}               # seconds before a failed action is tried again
+VIRSH="timeout 10 virsh -c qemu:///system" # a wedged libvirtd must not stall the host side
 
 log() { logger -t br0-uplink-watch -- "$*"; }
 
-guest_attached() {
-	bridge link show master "$BRIDGE" 2>/dev/null |
-		grep -qE '^[0-9]+: (vnet|tap|macvtap)'
+# Reconfiguring an interface makes the kernel emit more link events, which bring us
+# straight back here. Without a cooldown each retry aborts the DHCP run started by the
+# previous one, and the address never arrives.
+declare -A last_try=()
+cooldown() { # <key>
+	local now=$SECONDS prev=${last_try[$1]:-0}
+	[ "$prev" != 0 ] && [ $((now - prev)) -lt "$RETRY" ] && return 1
+	last_try[$1]=$now
+	return 0
 }
 
-apply() {
-	local carrier
-	carrier=$(cat "/sys/class/net/$PORT/carrier" 2>/dev/null) || carrier=0
+have_uplink() {
+	[ "$(cat "/sys/class/net/$PORT/carrier" 2>/dev/null)" = 1 ]
+}
 
-	if [ "$carrier" = 1 ]; then
-		if [ -n "$(ip -4 -br addr show "$BRIDGE" | awk '{print $3}')" ]; then
-			return 0 # uplink is up and the bridge already has an address
-		fi
+bridge_address() {
+	ip -4 -br addr show "$BRIDGE" 2>/dev/null | awk '{print $3}'
+}
+
+# `bridge link show master X` does not actually filter by master here, so ask the kernel.
+guest_attached() {
+	local port
+	for port in "/sys/class/net/$BRIDGE/brif/"*; do
+		case ${port##*/} in
+		vnet* | tap* | macvtap*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+host_apply() {
+	if have_uplink; then
+		[ -n "$(bridge_address)" ] && return 0 # already configured
+		cooldown host || return 0              # let the running DHCP finish
 		if guest_attached; then
 			log "uplink back on $PORT, reapplying $BRIDGE (guest attached)"
 			nmcli device reapply "$BRIDGE" >/dev/null
@@ -38,19 +68,107 @@ apply() {
 			nmcli connection up "$BRIDGE" >/dev/null
 		fi
 	else
-		if [ -z "$(ip -4 -br addr show "$BRIDGE" | awk '{print $3}')" ]; then
-			return 0 # already cleared
-		fi
+		last_try[host]=0                       # do not delay the next restore
+		[ -z "$(bridge_address)" ] && return 0 # already cleared
 		log "no uplink on $PORT, clearing $BRIDGE IPv4 so wifi takes over"
 		ip -4 addr flush dev "$BRIDGE"
 		resolvectl revert "$BRIDGE" 2>/dev/null
 	fi
 }
 
+running_domains() {
+	$VIRSH list --name --state-running 2>/dev/null | sed '/^$/d'
+}
+
+# Emits "<current bridge> <tap> <mac>" for every NIC we manage. A NIC attached to
+# anything else was put there deliberately, so it is left alone.
+managed_nics() { # <domain>
+	$VIRSH domiflist "$1" 2>/dev/null |
+		awk -v lan="$BRIDGE" -v nat="$NAT_BRIDGE" \
+			'NR > 2 && NF >= 5 && $2 == "bridge" && ($3 == lan || $3 == nat) { print $3, $1, $5 }'
+}
+
+tap_master() { # <tap>; empty when the tap is not enslaved
+	local link
+	[ -L "/sys/class/net/$1/master" ] || return 1
+	link=$(readlink "/sys/class/net/$1/master") || return 1
+	printf '%s\n' "${link##*/}"
+}
+
+# The interface XML comes from libvirt itself, so <target>, <alias> and the PCI address
+# survive the round trip; only the source bridge is rewritten.
+swap_nic() { # <domain> <mac> <target bridge>
+	local dom=$1 mac=$2 target=$3 tmp rc=0
+	tmp=$(mktemp /run/br0-uplink-watch.XXXXXX) || return 1
+
+	$VIRSH domif-setlink "$dom" "$mac" down --print-xml 2>/dev/null |
+		sed -E "s|<source bridge=\"[^\"]+\"/>|<source bridge=\"$target\"/>|" >"$tmp"
+	if ! grep -q "<source bridge=\"$target\"/>" "$tmp"; then
+		log "$dom: could not build interface XML for NIC $mac"
+		rm -f "$tmp"
+		return 1
+	fi
+
+	log "$dom: moving NIC $mac to $target"
+	$VIRSH domif-setlink "$dom" "$mac" down >/dev/null 2>&1
+	if ! $VIRSH update-device "$dom" "$tmp" --live >/dev/null 2>&1; then
+		log "$dom: moving NIC $mac to $target failed"
+		rc=1
+	fi
+	$VIRSH domif-setlink "$dom" "$mac" up >/dev/null 2>&1 # flap makes the guest re-DHCP
+	rm -f "$tmp"
+	return $rc
+}
+
+guest_apply() {
+	local target dom src tap mac master
+	if have_uplink; then
+		target=$BRIDGE
+	else
+		target=$NAT_BRIDGE
+	fi
+
+	while IFS= read -r dom; do
+		while read -r src tap mac; do
+			if [ "$src" != "$target" ]; then
+				cooldown "$dom/$mac" || continue
+				swap_nic "$dom" "$mac" "$target" && last_try["$dom/$mac"]=0
+				continue
+			fi
+			# libvirt thinks the NIC is in the right place; make sure the kernel
+			# agrees. NetworkManager detaches foreign ports when it reactivates a
+			# bridge, and libvirt never notices, which leaves the guest offline.
+			[ -e "/sys/class/net/$tap" ] || continue
+			master=$(tap_master "$tap")
+			[ "$master" = "$target" ] && continue
+			log "$dom: re-attaching $tap to $target (was ${master:-detached})"
+			ip link set "$tap" master "$target"
+		done < <(managed_nics "$dom")
+	done < <(running_domains)
+}
+
+apply() {
+	host_apply
+	guest_apply
+}
+
+[ "${1:-}" = --once ] && {
+	apply
+	exit 0
+}
+
 apply
 
-# React to carrier changes; coalesce bursts of netlink messages.
-ip monitor link dev "$PORT" | while read -r _; do
-	read -r -t 2 _ || true # debounce link flaps
+# React to carrier changes, and re-apply every $POLL seconds so that a guest started
+# while the cable is out still lands on the NAT bridge.
+ip monitor link dev "$PORT" | while :; do
+	read -r -t "$POLL" _
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		read -r -t 2 _ || true # debounce link flaps
+	elif [ "$rc" -lt 128 ]; then
+		log "link monitor stream ended, restarting" # >128 is the read timeout
+		exit 1
+	fi
 	apply
 done

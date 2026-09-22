@@ -1,10 +1,11 @@
 [Unit]
-Description=Drop the KVM bridge's host IP when its uplink cable is gone
-After=NetworkManager.service
+Description=Follow the uplink cable for the host IP and the KVM guests' network
+After=NetworkManager.service libvirtd.service
 Wants=NetworkManager.service
 
 [Service]
 Type=simple
+Environment=POLL=30
 ExecStart=/usr/local/sbin/br0-uplink-watch
 Restart=always
 RestartSec=5
