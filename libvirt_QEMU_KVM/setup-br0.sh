@@ -19,6 +19,14 @@ install -Dm644 /dev/stdin /etc/NetworkManager/conf.d/10-br0.conf <<EOF
 [main]
 no-auto-default=interface-name:$PORT
 EOF
+# Any other ethernet adapter (USB, dock) ranks below br0 (425) and wifi (600), so
+# plugging one into a network without internet does not take over the default route.
+install -Dm644 /dev/stdin /etc/NetworkManager/conf.d/20-ethernet-metric.conf <<EOF
+[connection-ethernet-low-priority]
+match-device=type:ethernet
+ipv4.route-metric=700
+ipv6.route-metric=700
+EOF
 nmcli general reload conf
 
 # The bridge takes the NIC's MAC, so the router's DHCP lease/reservation stays the same.
